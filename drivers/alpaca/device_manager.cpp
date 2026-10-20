@@ -30,7 +30,16 @@
 #include "indilogger.h"
 
 #include <cstring>
+#include <algorithm>
+#include <cerrno>
 #include <sstream>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <limits>
+#include <stdexcept>
+#include <unistd.h>
 
 #ifdef _USE_SYSTEM_JSONLIB
 #include <nlohmann/json.hpp>
@@ -49,7 +58,100 @@ DeviceManager* DeviceManager::getInstance()
 
 DeviceManager::DeviceManager()
 {
+    loadDeviceNumberMap();
     DEBUGDEVICE("INDI Alpaca Server", INDI::Logger::DBG_SESSION, "Device manager initialized");
+}
+
+// Called at startup, or while m_Mutex is held. Persist reservations, not just live devices.
+void DeviceManager::loadDeviceNumberMap()
+{
+    const char *home = std::getenv("HOME");
+    if (!home || !*home)
+    {
+        DEBUGDEVICE("INDI Alpaca Server", INDI::Logger::DBG_WARNING,
+                    "HOME is unset; device numbers will only persist in memory");
+        return;
+    }
+    m_DeviceNumberMapPath = std::string(home) + "/.config/indi_alpaca/device_numbers.conf";
+    try
+    {
+        if (!std::filesystem::exists(m_DeviceNumberMapPath))
+            return;
+        std::ifstream input(m_DeviceNumberMapPath);
+        json entries;
+        input >> entries;
+        if (!entries.is_array())
+            throw std::runtime_error("Expected an array of device mappings");
+        std::map<std::string, BridgeKey> mappings;
+        std::set<BridgeKey> reserved;
+        for (const auto &entry : entries)
+        {
+            const auto name = entry.at("name").get<std::string>();
+            const auto type = entry.at("type").get<std::string>();
+            const auto &number = entry.at("number");
+            if (!number.is_number_integer() || number < 0 || number >= std::numeric_limits<int>::max())
+                throw std::runtime_error("Invalid device number");
+            BridgeKey key {type, number.get<int>()};
+            if (name.empty() || (type != "camera" && type != "telescope") ||
+                    !mappings.emplace(name, key).second || !reserved.insert(key).second)
+                throw std::runtime_error("Invalid or duplicate device mapping");
+        }
+        m_DeviceNumberMap = std::move(mappings);
+    }
+    catch (const std::exception &e)
+    {
+        DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_WARNING,
+                     "Cannot load device numbers from %s: %s. Using memory only; leaving file unchanged.",
+                     m_DeviceNumberMapPath.c_str(), e.what());
+        m_DeviceNumberMapPath.clear();
+    }
+}
+
+void DeviceManager::saveDeviceNumberMap()
+{
+    if (m_DeviceNumberMapPath.empty())
+        return;
+    std::string temporaryPath;
+    int fd = -1;
+    try
+    {
+        std::filesystem::create_directories(std::filesystem::path(m_DeviceNumberMapPath).parent_path());
+        json entries = json::array();
+        for (const auto &mapping : m_DeviceNumberMap)
+            entries.push_back({{"name", mapping.first}, {"type", mapping.second.first}, {"number", mapping.second.second}});
+        const auto contents = entries.dump(2) + "\n";
+        std::string pattern = m_DeviceNumberMapPath + ".XXXXXX";
+        fd = mkstemp(&pattern[0]);
+        if (fd < 0)
+            throw std::runtime_error("Cannot create temporary mapping file");
+        temporaryPath = pattern;
+        size_t offset = 0;
+        while (offset < contents.size())
+        {
+            const auto written = write(fd, contents.data() + offset, contents.size() - offset);
+            if (written < 0 && errno == EINTR)
+                continue;
+            if (written <= 0)
+                throw std::runtime_error("Cannot write mapping file");
+            offset += static_cast<size_t>(written);
+        }
+        if (fsync(fd) != 0)
+            throw std::runtime_error("Cannot flush mapping file");
+        const int closeResult = close(fd);
+        fd = -1;
+        if (closeResult != 0)
+            throw std::runtime_error("Cannot close mapping file");
+        std::filesystem::rename(temporaryPath, m_DeviceNumberMapPath);
+    }
+    catch (const std::exception &e)
+    {
+        if (fd >= 0)
+            close(fd);
+        if (!temporaryPath.empty())
+            unlink(temporaryPath.c_str());
+        DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_WARNING,
+                     "Cannot save device numbers: %s. Reservations remain in memory.", e.what());
+    }
 }
 
 DeviceManager::~DeviceManager()
@@ -110,7 +212,8 @@ void DeviceManager::createBridgeIfReady(INDI::BaseDevice device)
     const char *deviceName = device.getDeviceName();
 
     // Check if we already have a bridge for this device
-    if (m_DeviceNumberMap.find(deviceName) != m_DeviceNumberMap.end())
+    auto existing = m_DeviceNumberMap.find(deviceName);
+    if (existing != m_DeviceNumberMap.end() && m_Bridges.count(existing->second))
         return;
 
     // Check if device is ready (has non-zero interface)
@@ -125,15 +228,31 @@ void DeviceManager::createBridgeIfReady(INDI::BaseDevice device)
     std::string deviceType = getAlpacaDeviceType(interface);
     if (deviceType.empty())
     {
-        DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_WARNING, "Unsupported device interface: %u for device %s", interface,
+        DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_DEBUG, "Unsupported device interface: %u for device %s", interface,
                      deviceName);
         return;
     }
 
-    // Alpaca numbers devices from 0 within each device type, use the lowest free number
+    // Retain per-type numbering, reserving numbers even while devices are absent.
     int deviceNumber = 0;
-    while (m_Bridges.find({deviceType, deviceNumber}) != m_Bridges.end())
-        deviceNumber++;
+    if (existing != m_DeviceNumberMap.end())
+    {
+        if (existing->second.first != deviceType)
+        {
+            DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_WARNING,
+                         "Device type changed for %s; refusing to reuse its saved number", deviceName);
+            return;
+        }
+        deviceNumber = existing->second.second;
+    }
+    else
+    {
+        for (const auto &mapping : m_DeviceNumberMap)
+            if (mapping.second.first == deviceType)
+                deviceNumber = std::max(deviceNumber, mapping.second.second + 1);
+        if (deviceNumber == std::numeric_limits<int>::max())
+            return;
+    }
 
     auto bridge = createBridge(device, deviceNumber);
     if (!bridge)
@@ -144,6 +263,8 @@ void DeviceManager::createBridgeIfReady(INDI::BaseDevice device)
 
     m_Bridges[{deviceType, deviceNumber}] = std::move(bridge);
     m_DeviceNumberMap[deviceName] = {deviceType, deviceNumber};
+    if (existing == m_DeviceNumberMap.end())
+        saveDeviceNumberMap();
     DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_SESSION, "Created %s bridge for device %s with number %d",
                  deviceType.c_str(), deviceName, deviceNumber);
 }
@@ -154,6 +275,8 @@ void DeviceManager::removeDevice(INDI::BaseDevice device)
 
     const char *deviceName = device.getDeviceName();
     DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_SESSION, "Removing device: %s", deviceName);
+
+    m_Devices.erase(deviceName);
 
     // Check if device exists
     auto it = m_DeviceNumberMap.find(deviceName);
@@ -166,8 +289,7 @@ void DeviceManager::removeDevice(INDI::BaseDevice device)
     // Remove bridge
     BridgeKey key = it->second;
     m_Bridges.erase(key);
-    m_DeviceNumberMap.erase(it);
-    m_Devices.erase(deviceName);
+    // Keep the reservation so reconnects and restarts reuse the same number.
 
     DEBUGFDEVICE("INDI Alpaca Server", INDI::Logger::DBG_SESSION, "Removed %s device %s with number %d", key.first.c_str(),
                  deviceName, key.second);

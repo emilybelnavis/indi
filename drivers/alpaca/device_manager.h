@@ -96,6 +96,10 @@ class DeviceManager
         // Create a bridge for the device if it has no bridge yet and its interface is known and supported
         void createBridgeIfReady(INDI::BaseDevice device);
 
+        void loadDeviceNumberMap();
+        void saveDeviceNumberMap();
+        std::string m_DeviceNumberMapPath;
+
         // Create appropriate bridge for device type
         std::unique_ptr<IDeviceBridge> createBridge(INDI::BaseDevice device, int deviceNumber);
 

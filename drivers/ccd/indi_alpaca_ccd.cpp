@@ -157,6 +157,7 @@ void AlpacaCCD::ISGetProperties(const char *dev)
 
 bool AlpacaCCD::Connect()
 {
+    m_HasCCDTemperature = true;
     if (ServerAddressTP[0].isEmpty() || ServerAddressTP[1].isEmpty())
     {
         LOG_ERROR("Server address or port is not set.");
@@ -352,6 +353,7 @@ bool AlpacaCCD::Connect()
 
     // Clear existing capture formats from base class
     m_CaptureFormats.clear();
+    CaptureFormatSP.resize(0);
 
     // Add capture formats based on sensor type and typical Alpaca camera capabilities
     // Most Alpaca cameras support both 8-bit and 16-bit modes
@@ -379,6 +381,20 @@ bool AlpacaCCD::Connect()
             addCaptureFormat({"MONO_8", "Mono 8-bit", 8, true});
             addCaptureFormat({"MONO_16", "Mono 16-bit", 16, false});
             break;
+    }
+
+    // A saved format may belong to a different sensor type. Always select a
+    // valid default so findOnSwitchIndex() cannot become uint8_t index 255.
+    if (CaptureFormatSP.findOnSwitchIndex() < 0)
+    {
+        for (size_t i = 0; i < m_CaptureFormats.size(); ++i)
+        {
+            if (m_CaptureFormats[i].isDefault)
+            {
+                CaptureFormatSP[i].setState(ISS_ON);
+                break;
+            }
+        }
     }
 
     // Update CCD capabilities
@@ -1023,6 +1039,21 @@ bool AlpacaCCD::UpdateCCDFrame(int x, int y, int w, int h)
         return false;
     }
 
+    if (m_CameraXSize <= 0 || m_CameraYSize <= 0)
+    {
+        LOGF_WARN("Remote camera dimensions invalid: %dx%d. Skipping frame update.", m_CameraXSize, m_CameraYSize);
+        return false;
+    }
+    const int binX = PrimaryCCD.getBinX();
+    const int binY = PrimaryCCD.getBinY();
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x > m_CameraXSize || y > m_CameraYSize ||
+            w > m_CameraXSize - x || h > m_CameraYSize - y ||
+            binX <= 0 || binY <= 0 || w / binX <= 0 || h / binY <= 0)
+    {
+        LOGF_WARN("Ignoring invalid frame request (%d,%d) (%dx%d).", x, y, w, h);
+        return false;
+    }
+
     nlohmann::json response;
     nlohmann::json body;
     bool success;
@@ -1232,8 +1263,11 @@ std::string AlpacaCCD::getSensorTypeString(uint8_t sensorType)
 ////////////////////////////////////////////////////////////////////////////////////////////
 ///
 ////////////////////////////////////////////////////////////////////////////////////////////
-bool AlpacaCCD::sendAlpacaGET(const std::string& endpoint, nlohmann::json& response)
+bool AlpacaCCD::sendAlpacaGET(const std::string& endpoint, nlohmann::json& response, bool *unsupported)
 {
+    if (unsupported)
+        *unsupported = false;
+    response = nlohmann::json();
     if (!httpClient)
     {
         LOG_ERROR("HTTP client not initialized.");
@@ -1256,6 +1290,8 @@ bool AlpacaCCD::sendAlpacaGET(const std::string& endpoint, nlohmann::json& respo
 
     if (result->status != 200)
     {
+        if (unsupported && (result->status == 404 || result->status == 501))
+            *unsupported = true;
         LOGF_ERROR("HTTP GET %s returned status %d", endpoint.c_str(), result->status);
         return false;
     }
@@ -1267,6 +1303,8 @@ bool AlpacaCCD::sendAlpacaGET(const std::string& endpoint, nlohmann::json& respo
         // Check for Alpaca errors
         if (response.contains("ErrorNumber") && response["ErrorNumber"].get<int>() != 0)
         {
+            if (unsupported && response["ErrorNumber"].get<int>() == 0x400)
+                *unsupported = true;
             LOGF_ERROR("Alpaca error in %s: %d - %s", endpoint.c_str(),
                        response["ErrorNumber"].get<int>(),
                        response["ErrorMessage"].get<std::string>().c_str());
@@ -2289,8 +2327,15 @@ void AlpacaCCD::temperatureTimerTimeout()
     bool success;
     IPState newState = TemperatureNP.getState();
 
-    // Get current temperature
-    success = sendAlpacaGET("/ccdtemperature", response);
+    // Cooler monitoring is independent of optional temperature telemetry.
+    if (!m_HasCCDTemperature)
+    {
+        if (HasCooler())
+            updateCoolerStatus();
+        return;
+    }
+    bool unsupported = false;
+    success = sendAlpacaGET("/ccdtemperature", response, &unsupported);
     if (success)
     {
         m_CurrentTemperature = response["Value"].get<double>();
@@ -2302,7 +2347,13 @@ void AlpacaCCD::temperatureTimerTimeout()
     }
     else
     {
-        LOG_WARN("Failed to get temperature from Alpaca camera.");
+        if (unsupported)
+        {
+            m_HasCCDTemperature = false;
+            LOG_WARN("CCD temperature is unsupported; disabling temperature queries until reconnect.");
+        }
+        else
+            LOG_WARN("Failed to get temperature from Alpaca camera.");
         newState = IPS_ALERT;
     }
 

@@ -128,6 +128,7 @@ class CameraBridge : public IDeviceBridge
         void handlePercentCompleted(const httplib::Request &req, httplib::Response &res);
         void handleLastExposureDuration(const httplib::Request &req, httplib::Response &res);
         void handleLastExposureStartTime(const httplib::Request &req, httplib::Response &res);
+        void handleExposureResolution(const httplib::Request &req, httplib::Response &res);
         void handleExposureMin(const httplib::Request &req, httplib::Response &res);
         void handleExposureMax(const httplib::Request &req, httplib::Response &res);
 

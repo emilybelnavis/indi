@@ -123,7 +123,7 @@ class AlpacaCCD : public INDI::CCD
 
         // Alpaca Communication
         std::unique_ptr<httplib::Client> httpClient; // Declared here
-        bool sendAlpacaGET(const std::string &endpoint, nlohmann::json &response);
+        bool sendAlpacaGET(const std::string &endpoint, nlohmann::json &response, bool *unsupported = nullptr);
         bool sendAlpacaPUT(const std::string &endpoint, const nlohmann::json &request, nlohmann::json &response);
         std::string getAlpacaURL(const std::string &endpoint);
         uint32_t m_ClientTransactionID {1};
@@ -217,6 +217,7 @@ class AlpacaCCD : public INDI::CCD
         // Temperature and cooler monitoring
         INDI::Timer mTimerTemperature;
         void temperatureTimerTimeout();
+        bool m_HasCCDTemperature {true};
         double m_CurrentTemperature {0};
         double m_TargetTemperature {std::numeric_limits<double>::quiet_NaN()};
 

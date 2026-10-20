@@ -983,6 +983,12 @@ void CameraBridge::handleLastExposureStartTime(const httplib::Request &req, http
     sendResponseValue(res, req, m_LastExposureStartTime);
 }
 
+void CameraBridge::handleExposureResolution(const httplib::Request &req, httplib::Response &res)
+{
+    // Default to millisecond resolution, matching the bridge's exposure convention.
+    sendResponseValue(res, req, 0.001);
+}
+
 void CameraBridge::handleExposureMin(const httplib::Request &req, httplib::Response &res)
 {
     // Transaction IDs extracted in sendResponseValue

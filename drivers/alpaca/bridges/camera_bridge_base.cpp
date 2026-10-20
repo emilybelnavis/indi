@@ -187,6 +187,8 @@ void CameraBridge::handleRequest(const std::string &method, const httplib::Reque
         handleLastExposureDuration(req, res);
     else if (method == "lastexposurestarttime")
         handleLastExposureStartTime(req, res);
+    else if (method == "exposureresolution")
+        handleExposureResolution(req, res);
     else if (method == "exposuremin")
         handleExposureMin(req, res);
     else if (method == "exposuremax")
@@ -235,9 +237,9 @@ void CameraBridge::updateProperty(INDI::Property property)
         INDI::PropertyNumber numberProperty(property);
         for (auto &num : numberProperty)
         {
-            if (num.isNameMatch("CCD_MAX_X"))
+            if (num.isNameMatch("CCD_MAX_X") && num.getValue() > 0)
                 m_CameraXSize = static_cast<int>(num.getValue());
-            else if (num.isNameMatch("CCD_MAX_Y"))
+            else if (num.isNameMatch("CCD_MAX_Y") && num.getValue() > 0)
                 m_CameraYSize = static_cast<int>(num.getValue());
             else if (num.isNameMatch("CCD_PIXEL_SIZE_X"))
                 m_PixelSizeX = num.getValue();
@@ -274,9 +276,17 @@ void CameraBridge::updateProperty(INDI::Property property)
             else if (num.isNameMatch("Y"))
                 m_StartY = static_cast<int>(num.getValue());
             else if (num.isNameMatch("WIDTH"))
+            {
                 m_NumX = static_cast<int>(num.getValue());
+                if (m_CameraXSize <= 0 && m_NumX > 0)
+                    m_CameraXSize = m_NumX;
+            }
             else if (num.isNameMatch("HEIGHT"))
+            {
                 m_NumY = static_cast<int>(num.getValue());
+                if (m_CameraYSize <= 0 && m_NumY > 0)
+                    m_CameraYSize = m_NumY;
+            }
         }
         DEBUGFDEVICE(m_Device.getDeviceName(), INDI::Logger::DBG_DEBUG,
                      "Updated frame: (%d,%d) %dx%d", m_StartX, m_StartY, m_NumX, m_NumY);
